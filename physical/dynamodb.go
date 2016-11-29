@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/go-uuid"
 )
 
 const (
@@ -47,6 +48,12 @@ const (
 	// as locks. This prefix causes them not to be returned by
 	// List operations.
 	DynamoDBLockPrefix = "_"
+
+	// The lock TTL matches the default that Consul API uses, 15 seconds.
+	DynamoDBLockTTL = 15 * time.Second
+
+	// The amount of time to wait between the lock renewals
+	DynamoDBLockRenewInterval = 5 * time.Second
 
 	// DynamoDBLockRetryInterval is the amount of time to wait
 	// if a lock fails before trying again.
@@ -84,9 +91,18 @@ type DynamoDBRecord struct {
 type DynamoDBLock struct {
 	backend    *DynamoDBBackend
 	value, key string
+	identity   string
 	held       bool
 	lock       sync.Mutex
 	recovery   bool
+}
+
+type DynamoDBLockRecord struct {
+	Path     string
+	Key      string
+	Value    []byte
+	Identity []byte
+	Expires  int64
 }
 
 // newDynamoDBBackend constructs a DynamoDB backend. If the
@@ -360,10 +376,15 @@ func (d *DynamoDBBackend) List(prefix string) ([]string, error) {
 
 // LockWith is used for mutual exclusion based on the given key.
 func (d *DynamoDBBackend) LockWith(key, value string) (Lock, error) {
+	identity, err := uuid.GenerateUUID()
+	if err != nil {
+		return nil, err
+	}
 	return &DynamoDBLock{
 		backend:  d,
 		key:      filepath.Join(filepath.Dir(key), DynamoDBLockPrefix+filepath.Base(key)),
 		value:    value,
+		identity: identity,
 		recovery: d.recovery,
 	}, nil
 }
@@ -426,9 +447,10 @@ func (l *DynamoDBLock) Lock(stopCh <-chan struct{}) (doneCh <-chan struct{}, ret
 	select {
 	case <-success:
 		l.held = true
-		// after acquiring it successfully, we must watch
-		// the lock in order to close the leader channel
+		// after acquiring it successfully, we must renew the lock periodically,
+		// and watch the lock in order to close the leader channel
 		// once it is lost.
+		go l.periodicallyRenewLock(leader)
 		go l.watch(leader)
 	case retErr = <-errors:
 		close(stop)
@@ -481,55 +503,84 @@ func (l *DynamoDBLock) Value() (bool, string, error) {
 func (l *DynamoDBLock) tryToLock(stop, success chan struct{}, errors chan error) {
 	ticker := time.NewTicker(DynamoDBLockRetryInterval)
 
-	record := DynamoDBRecord{
-		Path:  recordPathForVaultKey(l.key),
-		Key:   recordKeyForVaultKey(l.key),
-		Value: []byte(l.value),
-	}
-	item, err := dynamodbattribute.ConvertToMap(record)
-	if err != nil {
-		errors <- err
-		return
-	}
-
 	for {
 		select {
 		case <-stop:
 			ticker.Stop()
 		case <-ticker.C:
-			_, err := l.backend.client.PutItem(&dynamodb.PutItemInput{
-				TableName:           aws.String(l.backend.table),
-				Item:                item,
-				ConditionExpression: aws.String("attribute_not_exists(#p) or attribute_not_exists(#k)"),
-				ExpressionAttributeNames: map[string]*string{
-					"#p": aws.String("Path"),
-					"#k": aws.String("Key"),
-				},
-			})
+			err := l.writeItem()
 			if err != nil {
-				if err, ok := err.(awserr.Error); ok && err.Code() != "ConditionalCheckFailedException" {
-					errors <- err
-				}
-				if l.recovery {
-					_, err := l.backend.client.DeleteItem(&dynamodb.DeleteItemInput{
-						TableName: aws.String(l.backend.table),
-						Key: map[string]*dynamodb.AttributeValue{
-							"Path": {S: aws.String(record.Path)},
-							"Key":  {S: aws.String(record.Key)},
-						},
-					})
-					if err != nil {
-						errors <- fmt.Errorf("could not delete lock record: %s", err)
-					} else {
-						l.recovery = false
+				if err, ok := err.(awserr.Error); ok {
+					// Don't report a condition check failure, this means that the lock
+					// is already being held.
+					if err.Code() != "ConditionalCheckFailedException" {
+						errors <- err
 					}
+				} else {
+					// Its not an AWS error, and is probably not transient, bail out.
+					errors <- err
+					return
 				}
 			} else {
 				ticker.Stop()
 				close(success)
+				return
 			}
 		}
 	}
+}
+
+func (l *DynamoDBLock) periodicallyRenewLock(done chan struct{}) {
+	for {
+		select {
+		case <-time.After(DynamoDBLockRenewInterval):
+			l.writeItem()
+		case <-done:
+			return
+		}
+	}
+}
+
+// Attempts to put/update the dynamodb item using condition expressions to
+// evaluate the TTL.
+func (l *DynamoDBLock) writeItem() error {
+	now := time.Now()
+
+	_, err := l.backend.client.UpdateItem(&dynamodb.UpdateItemInput{
+		TableName: aws.String(l.backend.table),
+		Key: map[string]*dynamodb.AttributeValue{
+			"Path": &dynamodb.AttributeValue{S: aws.String(recordPathForVaultKey(l.key))},
+			"Key":  &dynamodb.AttributeValue{S: aws.String(recordKeyForVaultKey(l.key))},
+		},
+		UpdateExpression: aws.String("SET #value=:value, #identity=:identity, #expires=:expires"),
+		// If both key and path already exist, we can only write if
+		// A. identity is equal to our identity (or the identity doesn't exist)
+		// or
+		// B. The ttl on the item is <= to the current time
+		ConditionExpression: aws.String(
+			"attribute_not_exists(#path) or " +
+				"attribute_not_exists(#key) or " +
+				// To work when upgrading from older versions that did not include the
+				// Identity attribute, we first check if the attr doesn't exist, and if
+				// it does, then we check if the identity is equal to our own.
+				"(attribute_not_exists(#identity) or #identity = :identity) or " +
+				"#expires <= :now",
+		),
+		ExpressionAttributeNames: map[string]*string{
+			"#path":     aws.String("Path"),
+			"#key":      aws.String("Key"),
+			"#identity": aws.String("Identity"),
+			"#expires":  aws.String("Expires"),
+			"#value":    aws.String("Value"),
+		},
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":identity": &dynamodb.AttributeValue{B: []byte(l.identity)},
+			":value":    &dynamodb.AttributeValue{B: []byte(l.value)},
+			":now":      &dynamodb.AttributeValue{N: aws.String(strconv.FormatInt(now.UnixNano(), 10))},
+			":expires":  &dynamodb.AttributeValue{N: aws.String(strconv.FormatInt(now.Add(DynamoDBLockTTL).UnixNano(), 10))},
+		},
+	})
+	return err
 }
 
 // watch checks whether the lock has changed in the
@@ -546,7 +597,14 @@ WatchLoop:
 	for {
 		select {
 		case <-ticker.C:
-			item, err := l.backend.Get(l.key)
+			resp, err := l.backend.client.GetItem(&dynamodb.GetItemInput{
+				TableName:      aws.String(l.backend.table),
+				ConsistentRead: aws.Bool(true),
+				Key: map[string]*dynamodb.AttributeValue{
+					"Path": {S: aws.String(recordPathForVaultKey(l.key))},
+					"Key":  {S: aws.String(recordKeyForVaultKey(l.key))},
+				},
+			})
 			if err != nil {
 				retries--
 				if retries == 0 {
@@ -555,7 +613,12 @@ WatchLoop:
 				continue
 			}
 
-			if item == nil || string(item.Value) != l.value {
+			if resp == nil {
+				break WatchLoop
+			}
+			record := &DynamoDBLockRecord{}
+			err = dynamodbattribute.UnmarshalMap(resp.Item, record)
+			if err != nil || string(record.Identity) != l.identity {
 				break WatchLoop
 			}
 		}
