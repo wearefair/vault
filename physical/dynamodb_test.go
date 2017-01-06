@@ -116,4 +116,112 @@ func TestDynamoDBHABackend(t *testing.T) {
 		t.Fatalf("dynamodb does not implement HABackend")
 	}
 	testHABackend(t, ha, ha)
+	testDynamoDBLockTTL(t, ha)
+}
+
+// Similar to testHABackend, but using internal implementation details to
+// trigger the lock failure scenario by setting the lock renew period for one
+// of the locks to a higher value than the lock TTL.
+func testDynamoDBLockTTL(t *testing.T, ha HABackend) {
+	// Set much smaller lock times to speed up the test.
+	lockTTL := time.Second * 3
+	renewInterval := time.Second * 1
+	watchInterval := time.Second * 1
+
+	// Get the lock
+	origLock, err := ha.LockWith("dynamodbttl", "bar")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	// set the first lock renew period to double the expected TTL.
+	lock := origLock.(*DynamoDBLock)
+	lock.renewInterval = lockTTL * 2
+	lock.ttl = lockTTL
+	lock.watchRetryInterval = watchInterval
+
+	// Attempt to lock
+	leaderCh, err := lock.Lock(nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if leaderCh == nil {
+		t.Fatalf("failed to get leader ch")
+	}
+
+	// Check the value
+	held, val, err := lock.Value()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !held {
+		t.Fatalf("should be held")
+	}
+	if val != "bar" {
+		t.Fatalf("bad value: %v", err)
+	}
+
+	// Second acquisition should succeed because the first lock should
+	// not renew within the 3 sec TTL.
+	origLock2, err := ha.LockWith("dynamodbttl", "baz")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	lock2 := origLock2.(*DynamoDBLock)
+	lock.renewInterval = renewInterval
+	lock.ttl = lockTTL
+	lock.watchRetryInterval = watchInterval
+
+	// Cancel attempt in 6 sec so as not to block unit tests forever
+	stopCh := make(chan struct{})
+	time.AfterFunc(lockTTL*2, func() {
+		close(stopCh)
+	})
+
+	// Attempt to lock should work
+	leaderCh2, err := lock2.Lock(stopCh)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if leaderCh2 == nil {
+		t.Fatalf("should get leader ch")
+	}
+
+	// Check the value
+	held, val, err = lock.Value()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !held {
+		t.Fatalf("should be held")
+	}
+	if val != "baz" {
+		t.Fatalf("bad value: %v", err)
+	}
+
+	// The first lock should have lost the leader channel
+	leaderChClosed := false
+	blocking := make(chan struct{})
+	time.AfterFunc(watchInterval*3, func() {
+		close(blocking)
+	})
+	// Attempt to read from the leader or the blocking channel, which ever one
+	// happens first.
+	go func() {
+		select {
+		case <-leaderCh:
+			leaderChClosed = true
+			close(blocking)
+		case <-blocking:
+			return
+		}
+	}()
+
+	<-blocking
+	if !leaderChClosed {
+		t.Fatalf("original lock did not have its leader channel closed.")
+	}
+
+	// Cleanup
+	lock2.Unlock()
 }

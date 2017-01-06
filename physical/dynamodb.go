@@ -95,6 +95,10 @@ type DynamoDBLock struct {
 	held       bool
 	lock       sync.Mutex
 	recovery   bool
+	// Allow modifying the Lock durations for ease of unit testing.
+	renewInterval      time.Duration
+	ttl                time.Duration
+	watchRetryInterval time.Duration
 }
 
 type DynamoDBLockRecord struct {
@@ -381,11 +385,14 @@ func (d *DynamoDBBackend) LockWith(key, value string) (Lock, error) {
 		return nil, err
 	}
 	return &DynamoDBLock{
-		backend:  d,
-		key:      filepath.Join(filepath.Dir(key), DynamoDBLockPrefix+filepath.Base(key)),
-		value:    value,
-		identity: identity,
-		recovery: d.recovery,
+		backend:            d,
+		key:                filepath.Join(filepath.Dir(key), DynamoDBLockPrefix+filepath.Base(key)),
+		value:              value,
+		identity:           identity,
+		recovery:           d.recovery,
+		renewInterval:      DynamoDBLockRenewInterval,
+		ttl:                DynamoDBLockTTL,
+		watchRetryInterval: DynamoDBWatchRetryInterval,
 	}, nil
 }
 
@@ -533,7 +540,7 @@ func (l *DynamoDBLock) tryToLock(stop, success chan struct{}, errors chan error)
 func (l *DynamoDBLock) periodicallyRenewLock(done chan struct{}) {
 	for {
 		select {
-		case <-time.After(DynamoDBLockRenewInterval):
+		case <-time.After(l.renewInterval):
 			l.writeItem()
 		case <-done:
 			return
@@ -577,7 +584,7 @@ func (l *DynamoDBLock) writeItem() error {
 			":identity": &dynamodb.AttributeValue{B: []byte(l.identity)},
 			":value":    &dynamodb.AttributeValue{B: []byte(l.value)},
 			":now":      &dynamodb.AttributeValue{N: aws.String(strconv.FormatInt(now.UnixNano(), 10))},
-			":expires":  &dynamodb.AttributeValue{N: aws.String(strconv.FormatInt(now.Add(DynamoDBLockTTL).UnixNano(), 10))},
+			":expires":  &dynamodb.AttributeValue{N: aws.String(strconv.FormatInt(now.Add(l.ttl).UnixNano(), 10))},
 		},
 	})
 	return err
@@ -592,7 +599,7 @@ func (l *DynamoDBLock) writeItem() error {
 func (l *DynamoDBLock) watch(lost chan struct{}) {
 	retries := DynamoDBWatchRetryMax
 
-	ticker := time.NewTicker(DynamoDBWatchRetryInterval)
+	ticker := time.NewTicker(l.watchRetryInterval)
 WatchLoop:
 	for {
 		select {
