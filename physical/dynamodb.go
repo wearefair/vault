@@ -361,18 +361,41 @@ func (d *DynamoDBBackend) List(prefix string) ([]string, error) {
 	d.permitPool.Acquire()
 	defer d.permitPool.Release()
 
-	err := d.client.QueryPages(queryInput, func(out *dynamodb.QueryOutput, lastPage bool) bool {
-		var record DynamoDBRecord
-		for _, item := range out.Items {
-			dynamodbattribute.ConvertFromMap(item, &record)
-			if !strings.HasPrefix(record.Key, DynamoDBLockPrefix) {
-				keys = append(keys, record.Key)
+	retryCount := 0
+	requestStart := time.Now()
+	for {
+		if out, err := d.client.Query(queryInput); err != nil {
+			if requestErr, ok := err.(awserr.Error); ok {
+				if requestErr.Code() == dynamodb.ErrCodeProvisionedThroughputExceededException {
+					duration := time.Duration(requestStart)
+					// max of 5 minutes for a given request
+					if duration < time.Minute*5 {
+						delay := time.Millisecond * time.Duration(math.Exp2(retryCount)) * 100
+						time.Sleep(delay)
+						retryCount += 1
+						continue
+					}
+				}
+			}
+			// If the error is not a throughput exceeded exception, or we have exceeded the time
+			// allotted for retrying, then return the original error.
+			return nil, err
+		} else {
+			var record DynamoDBRecord
+			for _, item := range out.Items {
+				dynamodbattribute.ConvertFromMap(item, &record)
+				if !strings.HasPrefix(record.Key, DynamoDBLockPrefix) {
+					keys = append(keys, record.Key)
+				}
+			}
+			if out.LastEvaluatedKey != nil {
+				queryInput.ExclusiveStartKey = out.LastEvaluatedKey
+				retryCount := 0
+				requestStart := time.Now()
+			} else {
+				break
 			}
 		}
-		return !lastPage
-	})
-	if err != nil {
-		return nil, err
 	}
 
 	return keys, nil
