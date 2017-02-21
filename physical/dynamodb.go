@@ -347,10 +347,10 @@ func (d *DynamoDBBackend) List(prefix string) ([]string, error) {
 		if out, err := d.client.Query(queryInput); err != nil {
 			if requestErr, ok := err.(awserr.Error); ok {
 				if requestErr.Code() == dynamodb.ErrCodeProvisionedThroughputExceededException {
-					duration := time.Duration(requestStart)
+					duration := time.Since(requestStart)
 					// max of 5 minutes for a given request
 					if duration < time.Minute*5 {
-						delay := time.Millisecond * time.Duration(math.Exp2(retryCount)) * 100
+						delay := time.Millisecond * time.Duration(math.Exp2(float64(retryCount))) * 100
 						time.Sleep(delay)
 						retryCount += 1
 						continue
@@ -370,8 +370,8 @@ func (d *DynamoDBBackend) List(prefix string) ([]string, error) {
 			}
 			if out.LastEvaluatedKey != nil {
 				queryInput.ExclusiveStartKey = out.LastEvaluatedKey
-				retryCount := 0
-				requestStart := time.Now()
+				retryCount = 0
+				requestStart = time.Now()
 			} else {
 				break
 			}
