@@ -263,8 +263,9 @@ func (d *DynamoDBBackend) Put(entry *Entry) error {
 			},
 		})
 	}
-
-	return d.batchWriteRequests(requests)
+	return retry(retryConfig{maxDuration: time.Second * 10, multiplier: 100}, func() error {
+		return d.batchWriteRequests(requests)
+	})
 }
 
 // Get is used to fetch an entry
@@ -274,17 +275,25 @@ func (d *DynamoDBBackend) Get(key string) (*Entry, error) {
 	d.permitPool.Acquire()
 	defer d.permitPool.Release()
 
-	resp, err := d.client.GetItem(&dynamodb.GetItemInput{
-		TableName:      aws.String(d.table),
-		ConsistentRead: aws.Bool(true),
-		Key: map[string]*dynamodb.AttributeValue{
-			"Path": {S: aws.String(recordPathForVaultKey(key))},
-			"Key":  {S: aws.String(recordKeyForVaultKey(key))},
-		},
+	var resp *dynamodb.GetItemOutput
+	var err error
+
+	err = retry(retryConfig{maxDuration: time.Second * 10, multiplier: 100}, func() error {
+		resp, err = d.client.GetItem(&dynamodb.GetItemInput{
+			TableName:      aws.String(d.table),
+			ConsistentRead: aws.Bool(true),
+			Key: map[string]*dynamodb.AttributeValue{
+				"Path": {S: aws.String(recordPathForVaultKey(key))},
+				"Key":  {S: aws.String(recordKeyForVaultKey(key))},
+			},
+		})
+		return err
 	})
+
 	if err != nil {
 		return nil, err
 	}
+
 	if resp.Item == nil {
 		return nil, nil
 	}
@@ -333,7 +342,9 @@ func (d *DynamoDBBackend) Delete(key string) error {
 		}
 	}
 
-	return d.batchWriteRequests(requests)
+	return retry(retryConfig{maxDuration: time.Second * 10, multiplier: 100}, func() error {
+		return d.batchWriteRequests(requests)
+	})
 }
 
 // List is used to list all the keys under a given
@@ -361,44 +372,67 @@ func (d *DynamoDBBackend) List(prefix string) ([]string, error) {
 	d.permitPool.Acquire()
 	defer d.permitPool.Release()
 
+	moreItems := true
+	for moreItems {
+		err := retry(newRetryConfig(), func() error {
+			if out, err := d.client.Query(queryInput); err != nil {
+				return err
+			} else {
+				var record DynamoDBRecord
+				for _, item := range out.Items {
+					dynamodbattribute.ConvertFromMap(item, &record)
+					if !strings.HasPrefix(record.Key, DynamoDBLockPrefix) {
+						keys = append(keys, record.Key)
+					}
+				}
+				if out.LastEvaluatedKey != nil {
+					queryInput.ExclusiveStartKey = out.LastEvaluatedKey
+				} else {
+					moreItems = false
+				}
+				return nil
+			}
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return keys, nil
+}
+
+type retryConfig struct {
+	maxDuration time.Duration
+	multiplier  int
+}
+
+func newRetryConfig() retryConfig {
+	return retryConfig{
+		maxDuration: time.Minute * 5,
+		multiplier:  100,
+	}
+}
+
+func retry(config retryConfig, f func() error) error {
 	retryCount := 0
-	requestStart := time.Now()
+	start := time.Now()
 	for {
-		if out, err := d.client.Query(queryInput); err != nil {
+		if err := f(); err != nil {
 			if requestErr, ok := err.(awserr.Error); ok {
 				if requestErr.Code() == dynamodb.ErrCodeProvisionedThroughputExceededException {
-					duration := time.Since(requestStart)
-					// max of 5 minutes for a given request
-					if duration < time.Minute*5 {
-						delay := time.Millisecond * time.Duration(math.Exp2(float64(retryCount))) * 100
+					duration := time.Since(start)
+					if duration < config.maxDuration {
+						delay := time.Millisecond * time.Duration(math.Exp2(float64(retryCount))) * time.Duration(config.multiplier)
 						time.Sleep(delay)
 						retryCount += 1
 						continue
 					}
 				}
 			}
-			// If the error is not a throughput exceeded exception, or we have exceeded the time
-			// allotted for retrying, then return the original error.
-			return nil, err
-		} else {
-			var record DynamoDBRecord
-			for _, item := range out.Items {
-				dynamodbattribute.ConvertFromMap(item, &record)
-				if !strings.HasPrefix(record.Key, DynamoDBLockPrefix) {
-					keys = append(keys, record.Key)
-				}
-			}
-			if out.LastEvaluatedKey != nil {
-				queryInput.ExclusiveStartKey = out.LastEvaluatedKey
-				retryCount = 0
-				requestStart = time.Now()
-			} else {
-				break
-			}
+			return err
 		}
 	}
-
-	return keys, nil
+	return nil
 }
 
 // LockWith is used for mutual exclusion based on the given key.
